@@ -33,7 +33,7 @@ Fix_Speed = 50  # 기본 주행 속도. 상황에 따라 조절 가능 [cite: 12
 Slow_Speed = 20
 Min_Speed = 5   # 최소 주행 속도 (예: 장애물 회피 시)
 Max_Speed = 100  # 최대 주행 속도
-Angle_Limit = 50 # 최대 조향각 (절대값, xycar_motor 토픽은 -100~100이지만 실제 차량은 +/-20도) [cite: 129]
+Angle_Limit = 75 # 최대 조향각 (절대값, xycar_motor 토픽은 -100~100이지만 실제 차량은 +/-20도) [cite: 129]
 prev_angle = 0.0
 
 last_avoidance_time = 0  # 마지막 차선변경 시각 저장용 (초)
@@ -395,74 +395,93 @@ def detect_cones_only_camera(image):
 #=============================================
 # 라바콘 주행행
 #=============================================
-def calculate_cone_steering(current_image):
-    global prev_angle
-    if current_image.size == 0:
-        return 0.0
-    height = current_image.shape[0]
-    roi = current_image[int(height * 0.6):, :]
+# 전역 상태 변수
+def calculate_cone_steering_camera(image, prev_angle=0, debug=False):
 
-    # 1. HSV 변환
-    hsv = cv2.cvtColor(current_image, cv2.COLOR_BGR2HSV)
+    if image is None or image.size == 0:
+        return prev_angle
 
-    # 2. 라바콘 색상 마스크 적용 (Hue ≈ 8)
-    LOWER_CONE = np.array([5, 80, 150])
-    UPPER_CONE = np.array([15, 255, 255])
-    mask = cv2.inRange(hsv, LOWER_CONE, UPPER_CONE)
+    height, width = image.shape[:2]
+    roi_start = int(height * 0.7)
+    roi = image[roi_start:, :]
 
-    # 3. 노이즈 제거
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    LOWER_ORANGE = np.array([5, 100, 100])
+    UPPER_ORANGE = np.array([20, 255, 255])
+    mask = cv2.inRange(hsv, LOWER_ORANGE, UPPER_ORANGE)
+
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-    # 4. 윤곽선 검출
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    centers = []
 
-    # 5. 중심점 계산
-    height, width = current_image.shape[:2]
-    cone_centers = []
+    # 중앙 무시 영역 정의 (45%~55%)
+    center_ignore_min = int(width * 0.45)
+    center_ignore_max = int(width * 0.55)
+
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area > 100:  # 너무 작은 건 무시
+        if area > 150:
             M = cv2.moments(cnt)
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"])
-                cone_centers.append(cx)
+                cy = int(M["m01"] / M["m00"])
+                # 중앙 영역 무시
+                if center_ignore_min <= cx <= center_ignore_max:
+                    continue
+                centers.append((cx, cy))
 
-    if len(cone_centers) < 2:
-        # 라바콘이 2개 이상 감지되지 않으면 중앙 직진
-        return 0.0
+    vis = roi.copy()
+    left = []
+    right = []
+    for cx, cy in centers:
+        if cx < width // 2:
+            left.append(cx)
+            cv2.circle(vis, (cx, cy), 5, (255, 0, 0), -1)
+        else:
+            right.append(cx)
+            cv2.circle(vis, (cx, cy), 5, (0, 0, 255), -1)
 
-    # 간격 기준 필터링
-    cone_centers.sort()
-    valid_pairs = []
-    for i in range(len(cone_centers) - 1):
-        gap = cone_centers[i+1] - cone_centers[i]
-        if gap >= 100:  # 최소 허용 간격 (튜닝 필요)
-            center = (cone_centers[i+1] + cone_centers[i]) / 2
-            valid_pairs.append(center)
 
-    if not valid_pairs:
-        return prev_angle # 유효한 간격 없음 → 직진
+    angle = prev_angle
 
-    # 6. 좌우 라바콘 중심 간 평균 → 경로 중앙
-    cone_center_x = sum(cone_centers) / len(cone_centers)
-    image_center_x = width / 2
+    if len(left) > 0 and len(right) > 0:
+        left_x = min(left)
+        right_x = max(right)
+        gap = right_x - left_x
 
-    # 7. 오차 기반 조향각 계산
-    error = cone_center_x - image_center_x
-    Kp = 1  # 비례 계수 (튜닝 필요)
-    angle = Kp * error
+        if gap < 350:
+            if debug: print(f"[CAMERA] 라바콘 간격 {gap}px < 350 → 이전 각도 유지")
+        else:
+            mid_x = (left_x + right_x) // 2
+            error = mid_x - width // 2
+            angle = np.clip(0.6 * error, -40, 40)
+            if debug:
+                print(f"[CAMERA] 중앙: {mid_x}, 간격: {gap}, 조향: {angle:.2f}")
+                cv2.line(vis, (mid_x, 0), (mid_x, vis.shape[0]), (0, 255, 0), 2)
+                cv2.line(vis, (width // 2, 0), (width // 2, vis.shape[0]), (0, 255, 255), 2)
 
-    # 디버깅용 표시
-    for cx in cone_centers:
-        cv2.circle(current_image, (cx, int(height * 0.8)), 5, (0, 255, 255), -1)
-    cv2.line(current_image, (int(cone_center_x), int(height * 0.6)), (int(cone_center_x), height), (0, 255, 255), 2)
-    print(f"라바콘 간 거리: {gap}px")
-    prev_angle = angle
+    elif len(left) > 0:
+        left_x = min(left)
+        angle = 70
+        if debug: print("[CAMERA] 왼쪽 라바콘만 감지 → 우회전")
+
+    elif len(right) > 0:
+        right_x = max(right)
+        angle = -70
+        if debug: print("[CAMERA] 오른쪽 라바콘만 감지 → 좌회전")
+
+    else:
+        if debug: print("[CAMERA] 라바콘 없음 → 이전 각도 유지")
+
+    if debug:
+        cv2.imshow("Cone Detection (camera)", vis)
+        cv2.rectangle(vis, (center_ignore_min, 0), (center_ignore_max, vis.shape[0]), (0, 255, 255), 2)
+        cv2.waitKey(1)
+
     return angle
-
-
 
 
 
@@ -638,8 +657,8 @@ def start():
         
         elif current_mission_state == "CONE_NAVIGATION":
             # 라바콘 사이 조향각 계산
-            cone_angle = calculate_cone_steering(current_image_data)
-
+            cone_angle = calculate_cone_steering_camera(current_image_data, prev_angle, True)
+            prev_angle = cone_angle
             cone_visible = detect_cones_only_camera(current_image_data)
             print(f"[STATE] 🟧 라바콘 사이 주행 중 (angle: {cone_angle:.2f})")
             target_angle = cone_angle
